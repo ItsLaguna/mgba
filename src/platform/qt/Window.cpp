@@ -21,6 +21,7 @@
 #ifdef USE_SQLITE3
 #include "ArchiveInspector.h"
 #include "library/LibraryController.h"
+#include "library/LibraryCoverManager.h"
 #endif
 
 #include "AboutScreen.h"
@@ -134,6 +135,10 @@ Window::Window(CoreManager* manager, ConfigController* config, int playerId, QWi
 			}
 		}
 	}, this);
+	// Default to showing the library if no config entry exists yet
+	if (m_config->getOption("showLibrary").isEmpty()) {
+		m_config->setOption("showLibrary", true);
+	}
 	m_config->updateOption("showLibrary");
 
 	ConfigOption* showFilenameInLibrary = m_config->addOption("showFilenameInLibrary");
@@ -143,14 +148,31 @@ Window::Window(CoreManager* manager, ConfigController* config, int playerId, QWi
 	m_config->updateOption("showFilenameInLibrary");
 	ConfigOption* libraryStyle = m_config->addOption("libraryStyle");
 	libraryStyle->connect([this](const QVariant& value) {
-		m_libraryView->setViewStyle(static_cast<LibraryStyle>(value.toInt()));
+		int idx = value.toInt();
+		if (idx == 2) {
+			// Index 2 = Grid view (our extension beyond the two built-in styles)
+			m_libraryView->setGridView(true);
+		} else {
+			m_libraryView->setGridView(false);
+			m_libraryView->setViewStyle(static_cast<LibraryStyle>(idx));
+		}
 	}, this);
-	m_config->updateOption("libraryStyle");
+	// Defer style restore until after LibraryController is fully constructed
+	QTimer::singleShot(0, this, [this]() {
+		if (m_libraryView) m_config->updateOption("libraryStyle");
+	});
+
+	// Persist view mode when user changes it via toolbar (avoids ConfigOption recursion)
+	connect(m_libraryView, &LibraryController::viewModeChanged, [this](int mode) {
+		m_config->setOption("libraryStyle", mode);
+	});
 
 	connect(m_libraryView, &LibraryController::startGame, [this]() {
 		VFile* output = m_libraryView->selectedVFile();
 		if (output) {
 			QPair<QString, QString> path = m_libraryView->selectedPath();
+			QString fullpath = path.first + "/" + path.second;
+			m_libraryView->recordGameLaunched(fullpath);
 			setController(m_manager->loadGame(output, path.second, path.first));
 		}
 	});
@@ -1749,6 +1771,9 @@ void Window::setupMenu(QMenuBar* menubar) {
 	}, "av", QKeySequence("Ctrl+M"));
 #endif
 
+#ifdef USE_SQLITE3
+#endif
+
 	m_actions.addMenu(tr("&Tools"), "tools");
 	m_actions.addAction(tr("View &logs..."), "viewLogs", static_cast<QWidget*>(m_logView), &QWidget::show, "tools");
 
@@ -1784,6 +1809,20 @@ void Window::setupMenu(QMenuBar* menubar) {
 #endif
 
 	m_actions.addAction(tr("Create forwarder..."), "createForwarder", openTView<ForwarderView>(), "tools");
+
+#ifdef USE_SQLITE3
+	m_actions.addSeparator("tools");
+	m_actions.addAction(tr("&Refresh Covers"), "refreshCovers", [this]() {
+		if (m_libraryView) {
+			m_libraryView->refreshCovers();
+		}
+	}, "tools");
+	m_actions.addAction(tr("Open &Covers Folder"), "openCoversFolder", [this]() {
+		if (m_libraryView && m_libraryView->coverManager()) {
+			m_libraryView->coverManager()->openCoversDir();
+		}
+	}, "tools");
+#endif
 
 	m_actions.addSeparator("tools");
 	m_actions.addAction(tr("Settings..."), "settings", this, &Window::openSettingsWindow, "tools")->setRole(Action::Role::SETTINGS);
