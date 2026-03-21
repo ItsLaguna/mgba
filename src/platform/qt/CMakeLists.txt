@@ -282,11 +282,15 @@ if(ENABLE_GDB_STUB)
 endif()
 
 if(USE_SQLITE3)
-	list(APPEND SOURCE_FILES
-		ArchiveInspector.cpp
-		library/LibraryController.cpp
-		library/LibraryEntry.cpp
-		library/LibraryModel.cpp)
+    list(APPEND SOURCE_FILES
+        ArchiveInspector.cpp
+        library/LibraryCoverManager.cpp
+        library/LibraryController.cpp
+        library/LibraryEntry.cpp
+        library/LibraryGridDelegate.cpp
+        library/LibraryModel.cpp
+        library/LibrarySideBar.cpp
+        library/LibraryToolBar.cpp)
 
 	set(TEST_QT_library_SRC
 		library/LibraryEntry.cpp

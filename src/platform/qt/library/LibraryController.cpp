@@ -1,5 +1,5 @@
 /* Copyright (c) 2014-2017 waddlesplash
- * Copyright (c) 2014-2020 Jeffrey Pfau
+ * Copyright (c) 2014-2024 Jeffrey Pfau
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -12,20 +12,46 @@
 #include "LibraryModel.h"
 #include "utils.h"
 
+#include "LibraryCoverManager.h"
+#include "LibraryGridDelegate.h"
+
+#include <QAction>
+#include <QEvent>
 #include <QHeaderView>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QMenu>
+#include <QLineEdit>
 #include <QListView>
 #include <QSortFilterProxyModel>
 #include <QTimer>
 #include <QTreeView>
+#include <QVBoxLayout>
+#include <QWidget>
 
 using namespace QGBA;
 
 LibraryController::LibraryController(QWidget* parent, const QString& path, ConfigController* config)
-	: QStackedWidget(parent)
+	: QSplitter(Qt::Horizontal, parent)
 	, m_config(config)
 {
+	setChildrenCollapsible(false);
+	setHandleWidth(1);
+
+	// Load persisted favorites and recently played from config
+	if (m_config) {
+		QString favStr = m_config->getOption("libraryFavorites");
+		if (!favStr.isEmpty()) {
+			for (const QString& p : favStr.split("|", Qt::SkipEmptyParts))
+				m_favorites.insert(p);
+		}
+		QString rpStr = m_config->getOption("libraryRecentlyPlayed");
+		if (!rpStr.isEmpty())
+			m_recentlyPlayed = rpStr.split("|", Qt::SkipEmptyParts);
+	}
+
 	if (!path.isNull()) {
-		// This can return NULL if the library is already open
 		m_library = std::shared_ptr<mLibrary>(mLibraryLoad(path.toUtf8().constData()), mLibraryDestroy);
 	}
 	if (!m_library) {
@@ -34,38 +60,246 @@ LibraryController::LibraryController(QWidget* parent, const QString& path, Confi
 
 	mLibraryAttachGameDB(m_library.get(), GBAApp::app()->gameDB());
 
+	// ---- Toolbar + content in a vertical layout inside one splitter pane --
+	auto* mainPane   = new QWidget(this);
+	auto* mainLayout = new QVBoxLayout(mainPane);
+	mainLayout->setContentsMargins(0, 0, 0, 0);
+	mainLayout->setSpacing(0);
+
+	m_toolBar = new LibraryToolBar(mainPane);
+	mainLayout->addWidget(m_toolBar);
+
+	m_viewStack = new QStackedWidget(mainPane);
+	mainLayout->addWidget(m_viewStack, 1);
+	addWidget(mainPane);
+
+	connect(m_toolBar, &LibraryToolBar::filterChanged,
+	        this, &LibraryController::setFilter);
+	connect(m_toolBar, &LibraryToolBar::viewModeChanged,
+	        this, [this](int mode) {
+		if (mode == 2) {
+			setGridView(true);
+		} else {
+			setGridView(false);
+			setViewStyle(mode == 1 ? LibraryStyle::STYLE_TREE : LibraryStyle::STYLE_LIST);
+		}
+		// Persist via emit so Window can save without triggering ConfigOption recursion
+		emit viewModeChanged(mode);
+	});
+	connect(m_toolBar, &LibraryToolBar::coverSizeChanged,
+	        this, [this](int size) {
+		if (m_gridDelegate && m_gridView) {
+			m_gridDelegate->setCoverSize(size);
+			updateGridSize();
+			m_gridView->reset();
+		}
+		if (m_config) m_config->setQtOption("libraryCoverSize", size);
+	});
+
+	// ---- Cover manager ----------------------------------------------------
+	m_coverManager = new LibraryCoverManager(
+		ConfigController::configDir() + "/covers", this);
+	// coversChanged connection wired after m_gridView is constructed (see below)
+
+	// ---- Model + views ----------------------------------------------------
 	m_libraryModel = new LibraryModel(this);
 
-	m_treeView = new QTreeView(this);
-	addWidget(m_treeView);
+	m_treeView = new QTreeView(m_viewStack);
+	m_viewStack->addWidget(m_treeView);
 	m_treeModel = new QSortFilterProxyModel(this);
 	m_treeModel->setSourceModel(m_libraryModel);
 	m_treeModel->setSortRole(Qt::EditRole);
+	m_treeModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
+	m_treeModel->setFilterKeyColumn(LibraryModel::COL_NAME);
 	m_treeView->setModel(m_treeModel);
 	m_treeView->setSortingEnabled(true);
 	m_treeView->setAlternatingRowColors(true);
 
-	m_listView = new QListView(this);
-	addWidget(m_listView);
+	m_listView = new QListView(m_viewStack);
+	m_viewStack->addWidget(m_listView);
 	m_listModel = new QSortFilterProxyModel(this);
 	m_listModel->setSourceModel(m_libraryModel);
 	m_listModel->setSortRole(Qt::EditRole);
+	m_listModel->setFilterCaseSensitivity(Qt::CaseInsensitive);
+	m_listModel->setFilterKeyColumn(LibraryModel::COL_NAME);
 	m_listView->setModel(m_listModel);
+
+	// ---- Grid view (cover art) --------------------------------------------
+	m_gridDelegate = new LibraryGridDelegate(m_coverManager, this);
+	m_gridView = new QListView(m_viewStack);
+	m_gridView->setViewMode(QListView::IconMode);
+	m_gridView->setResizeMode(QListView::Adjust);
+	m_gridView->setUniformItemSizes(true);
+	m_gridView->setSpacing(0);
+	m_gridView->setWordWrap(true);
+	m_gridView->setMouseTracking(true);
+	// Always-on scrollbar = stable viewport width = no flicker/reflow loop
+	m_gridView->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+	m_gridView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);  // enables hover highlight
+	m_gridView->setItemDelegate(m_gridDelegate);
+	m_gridView->setGridSize(m_gridDelegate->cardSize()); // enables DuckStation-style centering
+	m_gridView->setModel(m_listModel);   // list proxy ensures flat (no folders) in grid
+	m_viewStack->addWidget(m_gridView);
+	QObject::connect(m_gridView, &QAbstractItemView::activated, this, &LibraryController::startGame);
+	connect(m_coverManager, &LibraryCoverManager::coversChanged, this, [this]() {
+		m_gridView->viewport()->update();
+	});
+	m_gridView->viewport()->installEventFilter(this);
+
+
+	// Search bar live filtering
+
 
 	QObject::connect(m_treeView, &QAbstractItemView::activated, this, &LibraryController::startGame);
 	QObject::connect(m_listView, &QAbstractItemView::activated, this, &LibraryController::startGame);
+
+	// Context menu for favorites
+	auto showContextMenu = [this](const QPoint& pos) {
+		QAbstractItemView* view = qobject_cast<QAbstractItemView*>(sender());
+		if (!view) return;
+		QModelIndex idx = view->indexAt(pos);
+		if (!idx.isValid()) return;
+		QString fullpath = idx.data(LibraryModel::FullPathRole).toString();
+		if (fullpath.isEmpty()) return;
+
+		// Derive the filename stem (e.g. "Pokemon Crystal" from "Pokemon Crystal.gbc")
+		QString filename = fullpath.section('/', -1);
+		QString stem = QFileInfo(filename).completeBaseName();
+
+		bool fav = m_favorites.contains(fullpath);
+		QMenu menu(view);
+
+		// --- Favorites ---
+		QAction* favAction = menu.addAction(fav ? tr("Remove from Favorites") : tr("Add to Favorites"));
+		QObject::connect(favAction, &QAction::triggered, this, [this, fullpath]() {
+			toggleFavorite(fullpath);
+		});
+
+		// --- Cover art (only show if cover manager is available) ---
+		if (m_coverManager) {
+			menu.addSeparator();
+
+			// Show current cover status
+			QPixmap existing = m_coverManager->cover(QString(), QString(), filename);
+			QString coverLabel = existing.isNull()
+				? tr("Set Cover Art...")
+				: tr("Change Cover Art...");
+			QAction* coverAction = menu.addAction(coverLabel);
+			QObject::connect(coverAction, &QAction::triggered, this, [this, stem, view]() {
+				QString dest = m_coverManager->coversDir() + "/" + stem;
+				QString src = QFileDialog::getOpenFileName(
+					view,
+					tr("Select Cover Image for %1").arg(stem),
+					QString(),
+					tr("Images (*.png *.jpg *.jpeg)")
+				);
+				if (src.isEmpty()) return;
+
+				// Copy to covers dir, named after the filename stem
+				QString ext = QFileInfo(src).suffix().toLower();
+				QString destPath = dest + "." + ext;
+
+				// Remove any existing cover for this stem (either extension)
+				for (const QString& e : {QString("png"), QString("jpg"), QString("jpeg")}) {
+					QFile::remove(dest + "." + e);
+				}
+
+				if (QFile::copy(src, destPath)) {
+					m_coverManager->refresh();
+				} else {
+					// Try loading and re-saving via Qt in case of permissions/format issues
+					QPixmap pix(src);
+					if (!pix.isNull()) {
+						pix.save(destPath);
+						m_coverManager->refresh();
+					}
+				}
+			});
+
+			if (!existing.isNull()) {
+				QAction* removeCoverAction = menu.addAction(tr("Remove Cover Art"));
+				QObject::connect(removeCoverAction, &QAction::triggered, this, [this, stem]() {
+					QString dest = m_coverManager->coversDir() + "/" + stem;
+					for (const QString& e : {QString("png"), QString("jpg"), QString("jpeg")}) {
+						QFile::remove(dest + "." + e);
+					}
+					m_coverManager->refresh();
+				});
+			}
+		}
+
+		menu.exec(view->viewport()->mapToGlobal(pos));
+	};
+
+	m_treeView->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_listView->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_gridView->setContextMenuPolicy(Qt::CustomContextMenu);
+	QObject::connect(m_treeView, &QWidget::customContextMenuRequested, this, showContextMenu);
+	QObject::connect(m_listView, &QWidget::customContextMenuRequested, this, showContextMenu);
+	QObject::connect(m_gridView, &QWidget::customContextMenuRequested, this, showContextMenu);
 	QObject::connect(m_treeView->header(), &QHeaderView::sortIndicatorChanged, this, &LibraryController::sortChanged);
+
+	// Save tree expand/collapse state
+	QObject::connect(m_treeView, &QTreeView::expanded, this, [this](const QModelIndex&) {
+		if (!m_config) return;
+		// Save which paths are expanded as a list of fullpaths
+		QStringList expanded;
+		for (int i = 0; i < m_treeModel->rowCount(); ++i) {
+			QModelIndex proxyIdx = m_treeModel->index(i, 0);
+			if (m_treeView->isExpanded(proxyIdx)) {
+				expanded << proxyIdx.data(Qt::DisplayRole).toString();
+			}
+		}
+		m_config->setQtOption("libraryTreeExpanded", expanded.join("|"));
+	});
+	QObject::connect(m_treeView, &QTreeView::collapsed, this, [this](const QModelIndex&) {
+		if (!m_config) return;
+		QStringList expanded;
+		for (int i = 0; i < m_treeModel->rowCount(); ++i) {
+			QModelIndex proxyIdx = m_treeModel->index(i, 0);
+			if (m_treeView->isExpanded(proxyIdx)) {
+				expanded << proxyIdx.data(Qt::DisplayRole).toString();
+			}
+		}
+		m_config->setQtOption("libraryTreeExpanded", expanded.join("|"));
+	});
+
+	// Save column widths whenever user drags a column divider
+	QObject::connect(m_treeView->header(), &QHeaderView::sectionResized,
+	        this, [this](int, int, int) {
+		if (!m_config) return;
+		m_userResizedColumns = true;
+		m_config->setQtOption("libraryHeaderState", m_treeView->header()->saveState());
+	});
 
 	m_expandThrottle.setInterval(100);
 	m_expandThrottle.setSingleShot(true);
-	QObject::connect(&m_expandThrottle, &QTimer::timeout, this, qOverload<>(&LibraryController::resizeTreeView));
+	QObject::connect(&m_expandThrottle, &QTimer::timeout, this, [this]() { resizeTreeView(false); });
 	QObject::connect(m_libraryModel, &QAbstractItemModel::modelReset, &m_expandThrottle, qOverload<>(&QTimer::start));
 	QObject::connect(m_libraryModel, &QAbstractItemModel::rowsInserted, &m_expandThrottle, qOverload<>(&QTimer::start));
 
+	// Reflow columns when splitter is dragged or viewport geometry changes (window resize fix)
+	QObject::connect(this, &QSplitter::splitterMoved, this, [this]() {
+		QTimer::singleShot(0, this, [this]() { resizeTreeView(false); });
+	});
+	QObject::connect(m_treeView->header(), &QHeaderView::geometriesChanged, this, [this]() {
+		QTimer::singleShot(0, this, [this]() { resizeTreeView(false); });
+	});
+
+	connect(m_libraryModel, &QAbstractItemModel::modelReset,    this, &LibraryController::updateCountBadges);
+	connect(m_libraryModel, &QAbstractItemModel::rowsInserted,  this, &LibraryController::updateCountBadges);
+	connect(m_libraryModel, &QAbstractItemModel::rowsRemoved,   this, &LibraryController::updateCountBadges);
+
 	QVariant librarySort, librarySortOrder;
 	if (m_config) {
-		LibraryStyle libraryStyle = LibraryStyle(m_config->getOption("libraryStyle", int(LibraryStyle::STYLE_LIST)).toInt());
-		updateViewStyle(libraryStyle);
+		int storedStyle = m_config->getOption("libraryStyle", int(LibraryStyle::STYLE_LIST)).toInt();
+		if (storedStyle == 2) {
+			// Grid view - will be applied after construction via deferred updateOption
+		} else {
+			updateViewStyle(static_cast<LibraryStyle>(storedStyle));
+		}
+		// Restore toolbar button state to match stored view
+		if (m_toolBar) m_toolBar->setViewMode(storedStyle);
 		librarySort = m_config->getQtOption("librarySort");
 		librarySortOrder = m_config->getQtOption("librarySortOrder");
 	} else {
@@ -80,6 +314,27 @@ LibraryController::LibraryController(QWidget* parent, const QString& path, Confi
 	}
 	m_treeModel->sort(librarySort.toInt(), librarySortOrder.value<Qt::SortOrder>());
 	m_listModel->sort(0, Qt::AscendingOrder);
+
+	// Restore saved cover size
+	if (m_config && m_toolBar && m_gridDelegate) {
+		QVariant coverSize = m_config->getQtOption("libraryCoverSize");
+		if (!coverSize.isNull() && coverSize.canConvert<int>()) {
+			int size = coverSize.toInt();
+			m_gridDelegate->setCoverSize(size);
+			m_toolBar->setCoverSize(size);
+		}
+	}
+
+	// Restore saved header column widths (if any)
+	if (m_config) {
+		QVariant headerState = m_config->getQtOption("libraryHeaderState");
+		if (!headerState.isNull() && headerState.canConvert<QByteArray>()) {
+			m_treeView->header()->restoreState(headerState.toByteArray());
+			// Mark that user has set column widths — skip auto-resize
+			m_userResizedColumns = true;
+		}
+	}
+
 	refresh();
 }
 
@@ -94,6 +349,17 @@ void LibraryController::setViewStyle(LibraryStyle newStyle) {
 }
 
 void LibraryController::updateViewStyle(LibraryStyle newStyle) {
+	// Guard: views may not be constructed yet during config option restore
+	if (!m_treeView || !m_listView || !m_viewStack) {
+		m_currentStyle = newStyle;
+		return;
+	}
+	// Sync toolbar button (may be called from Window's ConfigOption handler)
+	if (m_toolBar) {
+		int toolbarMode = (newStyle == LibraryStyle::STYLE_TREE) ? 1 : 0;
+		m_toolBar->setViewMode(toolbarMode);
+	}
+
 	QString selected;
 	if (m_currentView) {
 		QModelIndex selectedIndex = m_currentView->selectionModel()->currentIndex();
@@ -110,9 +376,14 @@ void LibraryController::updateViewStyle(LibraryStyle newStyle) {
 		newView = m_treeView;
 	}
 
-	setCurrentWidget(newView);
+	m_viewStack->setCurrentWidget(newView);
 	m_currentView = newView;
 	selectEntry(selected);
+
+	// Restore saved expand state whenever we switch to tree view
+	if (newStyle == LibraryStyle::STYLE_TREE) {
+		restoreTreeExpandState();
+	}
 }
 
 void LibraryController::sortChanged(int column, Qt::SortOrder order) {
@@ -127,13 +398,10 @@ void LibraryController::selectEntry(const QString& fullpath) {
 		return;
 	}
 	QModelIndex index = m_libraryModel->index(fullpath);
-
-	// If the model is proxied in the current view, map the index to the proxy
 	QAbstractProxyModel* proxy = qobject_cast<QAbstractProxyModel*>(m_currentView->model());
 	if (proxy) {
 		index = proxy->mapFromSource(index);
 	}
-
 	if (index.isValid()) {
 		m_currentView->selectionModel()->setCurrentIndex(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Current);
 	}
@@ -177,7 +445,6 @@ QPair<QString, QString> LibraryController::selectedPath() {
 }
 
 void LibraryController::addDirectory(const QString& dir, bool recursive) {
-	// The worker thread temporarily owns the library
 	std::shared_ptr<mLibrary> library = m_library;
 	m_libraryJob = GBAApp::app()->submitWorkerJob(std::bind(&LibraryController::loadDirectory, this, dir, recursive), this, [this, library]() {
 		refresh();
@@ -188,7 +455,6 @@ void LibraryController::clear() {
 	if (m_libraryJob > 0) {
 		return;
 	}
-
 	mLibraryClear(m_library.get());
 	refresh();
 }
@@ -220,7 +486,6 @@ void LibraryController::refresh() {
 		m_knownGames[fullpath] = checkHash;
 	}
 
-	// Check for entries that were removed
 	for (const QString& path : removedEntries) {
 		m_knownGames.remove(path);
 	}
@@ -236,6 +501,12 @@ void LibraryController::refresh() {
 
 	setDisabled(false);
 	selectLastBootedGame();
+
+	// Restore tree expand state after model is populated
+	if (m_libraryModel->treeMode()) {
+		restoreTreeExpandState();
+	}
+
 	emit doneLoading();
 }
 
@@ -250,7 +521,6 @@ void LibraryController::selectLastBootedGame() {
 }
 
 void LibraryController::loadDirectory(const QString& dir, bool recursive) {
-	// This class can get deleted during this function (sigh) so we need to hold onto this
 	std::shared_ptr<mLibrary> library = m_library;
 	qint64 libraryJob = m_libraryJob;
 	mLibraryLoadDirectory(library.get(), dir.toUtf8().constData(), recursive);
@@ -266,32 +536,202 @@ void LibraryController::setShowFilename(bool showFilename) {
 	refresh();
 }
 
-void LibraryController::showEvent(QShowEvent*) {
-	resizeTreeView(false);
+void LibraryController::setFilter(const LibraryFilter& filter) {
+	m_activeFilter = filter;
+
+	// Build allow-set for section filters (Recently Played / Favorites)
+	QSet<QString> allowSet;
+	bool hasAllowSet = false;
+
+	if (filter.section == LibraryFilter::Section::RecentlyPlayed) {
+		allowSet = QSet<QString>(m_recentlyPlayed.begin(), m_recentlyPlayed.end());
+		hasAllowSet = true;
+	} else if (filter.section == LibraryFilter::Section::Favorites) {
+		allowSet = m_favorites;
+		hasAllowSet = true;
+	}
+
+	for (QSortFilterProxyModel* proxy : {m_treeModel, m_listModel}) {
+		if (hasAllowSet) {
+			// Filter by FullPathRole using a regex alternation of allowed paths
+			proxy->setFilterRole(LibraryModel::FullPathRole);
+			if (allowSet.isEmpty()) {
+				// Nothing matches — use an unmatchable pattern
+				proxy->setFilterRegularExpression(QRegularExpression("^$(?!.)"));
+			} else {
+				QStringList escaped;
+				for (const QString& p : allowSet)
+					escaped << QRegularExpression::escape(p);
+				proxy->setFilterRegularExpression(
+					QRegularExpression("^(" + escaped.join("|") + ")$"));
+			}
+		} else if (!filter.platform.isEmpty()) {
+			proxy->setFilterRole(Qt::DisplayRole);
+			proxy->setFilterKeyColumn(LibraryModel::COL_PLATFORM);
+			proxy->setFilterFixedString(filter.platform);
+		} else {
+			proxy->setFilterRole(Qt::DisplayRole);
+			proxy->setFilterKeyColumn(LibraryModel::COL_NAME);
+			proxy->setFilterFixedString(filter.searchTerm);
+		}
+	}
 }
 
-void LibraryController::resizeEvent(QResizeEvent*) {
-	resizeTreeView(false);
+void LibraryController::setGridView(bool grid) {
+	m_gridViewActive = grid;
+	if (!m_gridView || !m_viewStack) return; // not yet constructed
+	if (grid) {
+		m_libraryModel->setTreeMode(false);
+		m_viewStack->setCurrentWidget(m_gridView);
+		m_currentView = m_gridView;
+		// Sync toolbar button
+		if (m_toolBar) m_toolBar->setViewMode(2);
+	} else {
+		updateViewStyle(m_currentStyle); // updateViewStyle syncs toolbar for 0/1
+	}
+	// Do NOT call m_config->setOption here — causes infinite recursion via ConfigOption.
 }
 
-// This function automatically reallocates the horizontal space between the
-// columns in the view in a useful way when the window is resized.
+void LibraryController::refreshCovers() {
+	if (m_coverManager) {
+		m_coverManager->refresh();
+	}
+}
+
+void LibraryController::recordGameLaunched(const QString& fullpath) {
+	if (fullpath.isEmpty()) return;
+	m_recentlyPlayed.removeAll(fullpath);
+	m_recentlyPlayed.prepend(fullpath);
+	while (m_recentlyPlayed.size() > 50) m_recentlyPlayed.removeLast();
+	if (m_config) {
+		m_config->setOption("libraryRecentlyPlayed", m_recentlyPlayed.join("|"));
+	}
+	// Refresh view if currently showing recently played
+	if (m_activeFilter.section == LibraryFilter::Section::RecentlyPlayed) {
+		setFilter(m_activeFilter);
+	}
+}
+
+void LibraryController::toggleFavorite(const QString& fullpath) {
+	if (fullpath.isEmpty()) return;
+	if (m_favorites.contains(fullpath)) {
+		m_favorites.remove(fullpath);
+	} else {
+		m_favorites.insert(fullpath);
+	}
+	if (m_config) {
+		m_config->setOption("libraryFavorites", QStringList(m_favorites.values()).join("|"));
+	}
+	emit entryFavorited(fullpath, m_favorites.contains(fullpath));
+	// Refresh view if currently showing favorites
+	if (m_activeFilter.section == LibraryFilter::Section::Favorites) {
+		setFilter(m_activeFilter);
+	}
+}
+
+void LibraryController::restoreTreeExpandState() {
+	if (!m_config || !m_treeView) return;
+	QVariant expandedVar = m_config->getQtOption("libraryTreeExpanded");
+	if (expandedVar.isNull()) return;
+	QStringList expandedPaths = expandedVar.toString().split("|", Qt::SkipEmptyParts);
+	for (int i = 0; i < m_treeModel->rowCount(); ++i) {
+		QModelIndex proxyIdx = m_treeModel->index(i, 0);
+		bool shouldExpand = expandedPaths.contains(proxyIdx.data(Qt::DisplayRole).toString());
+		if (shouldExpand) {
+			m_treeView->expand(proxyIdx);
+		} else {
+			m_treeView->collapse(proxyIdx);
+		}
+	}
+}
+
+void LibraryController::updateCountBadges() {
+	if (!m_toolBar) {
+		return;
+	}
+
+	int all = 0, gba = 0, gbc = 0, gb = 0, sgb = 0;
+	int rows = m_libraryModel->rowCount();
+
+	for (int i = 0; i < rows; ++i) {
+		if (m_libraryModel->treeMode()) {
+			QModelIndex parent = m_libraryModel->index(i, 0);
+			int children = m_libraryModel->rowCount(parent);
+			all += children;
+			for (int j = 0; j < children; ++j) {
+				QString plat = m_libraryModel->index(j, LibraryModel::COL_PLATFORM, parent).data().toString();
+				if      (plat == "GBA") ++gba;
+				else if (plat == "GBC") ++gbc;
+				else if (plat == "GB")  ++gb;
+				else if (plat == "SGB") ++sgb;
+			}
+		} else {
+			++all;
+			QString plat = m_libraryModel->index(i, LibraryModel::COL_PLATFORM).data().toString();
+			if      (plat == "GBA") ++gba;
+			else if (plat == "GBC") ++gbc;
+			else if (plat == "GB")  ++gb;
+			else if (plat == "SGB") ++sgb;
+		}
+	}
+
+	if (m_toolBar) m_toolBar->setGameCounts(all, gba, gbc, gb, sgb);
+}
+
+void LibraryController::updateGridSize() {
+	if (!m_gridView || !m_gridDelegate) return;
+	const int viewportW = m_gridView->viewport()->width();
+	const int minCardW  = m_gridDelegate->cardSize().width();
+	if (minCardW <= 0 || viewportW <= 0) return;
+
+	// Fixed number of columns based on current card size and viewport width.
+	// We never change this mid-paint — no flickering.
+	// Use viewportW - 1 to prevent a column from being just 1px too wide
+	// and causing the scrollbar to appear/disappear
+	const int safeW = viewportW - 1;
+	const int cols  = qMax(1, safeW / minCardW);
+	const int cellW = safeW / cols;
+	const int cellH = m_gridDelegate->cardSize().height();
+
+	m_gridView->setUpdatesEnabled(false);
+	m_gridView->setGridSize(QSize(cellW, cellH));
+	m_gridView->setUpdatesEnabled(true);
+}
+
+bool LibraryController::eventFilter(QObject* obj, QEvent* event) {
+	// Only handle viewport resize; ignore everything else to avoid loops
+	if (m_gridView && obj == m_gridView->viewport()
+	        && event->type() == QEvent::Resize) {
+		updateGridSize();  // synchronous, no singleShot — prevents feedback loop
+	}
+	return QSplitter::eventFilter(obj, event);
+}
+
+void LibraryController::showEvent(QShowEvent* event) {
+	QSplitter::showEvent(event);
+	QTimer::singleShot(0, this, [this]() { resizeTreeView(false); });
+}
+
+void LibraryController::resizeEvent(QResizeEvent* event) {
+	QSplitter::resizeEvent(event);
+	// Defer: viewport geometry isn't updated until after this event returns
+	QTimer::singleShot(0, this, [this]() { resizeTreeView(false); });
+}
+
 void LibraryController::resizeTreeView(bool expand) {
-	// When new items are added to the model, make sure they are revealed.
 	if (expand) {
 		m_treeView->expandAll();
 	}
 
-	// Start off by asking the view how wide it thinks each column should be.
+	// Don't auto-resize columns if the user has manually set them
+	if (m_userResizedColumns) return;
+
 	int viewportWidth = m_treeView->viewport()->width();
 	int totalWidth = m_treeView->header()->sectionSizeHint(LibraryModel::MAX_COLUMN);
 	for (int column = 0; column < LibraryModel::MAX_COLUMN; column++) {
 		totalWidth += m_treeView->columnWidth(column);
 	}
 
-	// If there would be empty space, ask the view to redistribute it.
-	// The final column is set to fill any remaining width, so this
-	// should (at least) fill the window.
 	if (totalWidth < viewportWidth) {
 		totalWidth = 0;
 		for (int column = 0; column <= LibraryModel::MAX_COLUMN; column++) {
@@ -300,9 +740,6 @@ void LibraryController::resizeTreeView(bool expand) {
 		}
 	}
 
-	// If the columns would be too wide for the view now, try shrinking the
-	// "Location" column down to reduce horizontal scrolling, with a fixed
-	// minimum width of 100px.
 	if (totalWidth > viewportWidth) {
 		int locationWidth = m_treeView->columnWidth(LibraryModel::COL_LOCATION);
 		if (locationWidth > 100) {

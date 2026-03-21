@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2022 Jeffrey Pfau
+/* Copyright (c) 2013-2024 Jeffrey Pfau
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -38,10 +38,10 @@ LibraryModel::LibraryModel(QObject* parent)
 			QIcon icon;
 			icon.addFile(pathTemplate.arg("-256.png"), QSize(256, 256));
 			icon.addFile(pathTemplate.arg("-128.png"), QSize(128, 128));
-			icon.addFile(pathTemplate.arg("-32.png"), QSize(32, 32));
-			icon.addFile(pathTemplate.arg("-24.png"), QSize(24, 24));
-			icon.addFile(pathTemplate.arg("-16.png"), QSize(16, 16));
-			// This will silently and harmlessly fail if QSvgIconEngine isn't compiled in.
+			icon.addFile(pathTemplate.arg("-32.png"),  QSize(32, 32));
+			icon.addFile(pathTemplate.arg("-24.png"),  QSize(24, 24));
+			icon.addFile(pathTemplate.arg("-16.png"),  QSize(16, 16));
+			// Silently fails if QSvgIconEngine isn't compiled in.
 			icon.addFile(pathTemplate.arg(".svg"));
 			platformIcons[platform] = icon;
 		}
@@ -144,7 +144,7 @@ void LibraryModel::addEntriesTree(const QList<LibraryEntry>& items) {
 
 	for (const QString& base : byPath.keys()) {
 		QList<const LibraryEntry*>& pathItems = m_pathIndex[base];
-		QList<const LibraryEntry*>& newItems = byPath[base];
+		QList<const LibraryEntry*>& newItems  = byPath[base];
 
 		QModelIndex parent = indexForPath(base);
 		beginInsertRows(parent, pathItems.size(), pathItems.size() + newItems.size() - 1);
@@ -170,7 +170,7 @@ void LibraryModel::updateEntries(const QList<LibraryEntry>& items) {
 		SpanSet spans = iter.value();
 		spans.merge();
 		for (const SpanSet::Span& span : spans.spans) {
-			QModelIndex topLeft = index(span.left, 0, parent);
+			QModelIndex topLeft     = index(span.left,  0,          parent);
 			QModelIndex bottomRight = index(span.right, MAX_COLUMN, parent);
 			emit dataChanged(topLeft, bottomRight);
 		}
@@ -182,9 +182,6 @@ void LibraryModel::removeEntries(const QList<QString>& items) {
 	QHash<QString, SpanSet> removedTreeSpans;
 	int firstModifiedIndex = m_games.size();
 
-	// Remove the items from the game index and assemble a span
-	// set so that we can later inform the view of which rows
-	// were removed in an optimized way.
 	for (const QString& item : items) {
 		int pos = m_gameIndex.value(item, -1);
 		Q_ASSERT(pos >= 0);
@@ -192,7 +189,7 @@ void LibraryModel::removeEntries(const QList<QString>& items) {
 			firstModifiedIndex = pos;
 		}
 		LibraryEntry* entry = m_games[pos].get();
-		QModelIndex parent = indexForPath(entry->base);
+		QModelIndex parent  = indexForPath(entry->base);
 		Q_ASSERT(!m_treeMode || parent.isValid());
 		QList<const LibraryEntry*>& pathItems = m_pathIndex[entry->base];
 		int pathPos = pathItems.indexOf(entry);
@@ -203,12 +200,9 @@ void LibraryModel::removeEntries(const QList<QString>& items) {
 	}
 
 	if (!m_treeMode) {
-		// If not using a tree view, all entries are root entries.
 		removedRootSpans = removedGameSpans;
 	}
 
-	// Remove the paths from the path indexes.
-	// If it's a tree view, inform the view.
 	for (const QString& base : removedTreeSpans.keys()) {
 		SpanSet& spanSet = removedTreeSpans[base];
 		spanSet.merge();
@@ -238,8 +232,6 @@ void LibraryModel::removeEntries(const QList<QString>& items) {
 		}
 	}
 
-	// Remove the games from the backing store and path indexes,
-	// and tell the view to remove the root items.
 	removedRootSpans.merge();
 	removedRootSpans.sort(true);
 	for (const SpanSet::Span& span : removedRootSpans.spans) {
@@ -250,13 +242,11 @@ void LibraryModel::removeEntries(const QList<QString>& items) {
 				m_pathIndex.remove(base);
 			}
 		} else {
-			// In list view, remove games from the backing store immediately
 			m_games.erase(m_games.begin() + span.left, m_games.begin() + span.right + 1);
 		}
 		endRemoveRows();
 	}
 	if (m_treeMode) {
-		// In tree view, remove them after cleaning up the path indexes.
 		removedGameSpans.merge();
 		removedGameSpans.sort(true);
 		for (const SpanSet::Span& span : removedGameSpans.spans) {
@@ -264,7 +254,6 @@ void LibraryModel::removeEntries(const QList<QString>& items) {
 		}
 	}
 
-	// Finally, update the game index for the remaining items.
 	for (int i = m_games.size() - 1; i >= firstModifiedIndex; i--) {
 		m_gameIndex[m_games[i]->fullpath] = i;
 	}
@@ -323,7 +312,6 @@ int LibraryModel::rowCount(const QModelIndex& parent) const {
 }
 
 QVariant LibraryModel::folderData(const QModelIndex& index, int role) const {
-	// Precondition: index and role must have already been validated
 	if (role == Qt::DecorationRole) {
 		return qApp->style()->standardIcon(QStyle::SP_DirOpenIcon);
 	}
@@ -337,23 +325,16 @@ QVariant LibraryModel::folderData(const QModelIndex& index, int role) const {
 	return QVariant();
 }
 
-bool LibraryModel::validateIndex(const QModelIndex& index) const
-{
+bool LibraryModel::validateIndex(const QModelIndex& index) const {
 	if (index.model() != this || index.row() < 0 || index.column() < 0 || index.column() > MAX_COLUMN) {
-		// Obviously invalid index
 		return false;
 	}
-
 	if (index.parent().isValid() && !validateIndex(index.parent())) {
-		// Parent index is invalid
 		return false;
 	}
-
 	if (index.row() >= rowCount(index.parent())) {
-		// Row is out of bounds for this level of hierarchy
 		return false;
 	}
-
 	return true;
 }
 
@@ -363,6 +344,7 @@ QVariant LibraryModel::data(const QModelIndex& index, int role) const {
 		case Qt::EditRole:
 		case Qt::TextAlignmentRole:
 		case FullPathRole:
+		case PlatformStrRole:  // new: pass through to entry data below
 			break;
 		case Qt::ToolTipRole:
 			if (index.column() > COL_LOCATION) {
@@ -383,7 +365,9 @@ QVariant LibraryModel::data(const QModelIndex& index, int role) const {
 	}
 
 	if (role == Qt::TextAlignmentRole) {
-		return index.column() == COL_SIZE ? (int)(Qt::AlignTrailing | Qt::AlignVCenter) : (int)(Qt::AlignLeading | Qt::AlignVCenter);
+		return index.column() == COL_SIZE
+			? (int)(Qt::AlignTrailing | Qt::AlignVCenter)
+			: (int)(Qt::AlignLeading  | Qt::AlignVCenter);
 	}
 
 	const LibraryEntry* entry = nullptr;
@@ -401,20 +385,37 @@ QVariant LibraryModel::data(const QModelIndex& index, int role) const {
 		if (role == FullPathRole) {
 			return entry->fullpath;
 		}
+
 		switch (index.column()) {
 		case COL_NAME:
 			if (role == Qt::DecorationRole) {
-				return platformIcons.value(entry->displayPlatform(), qApp->style()->standardIcon(QStyle::SP_FileIcon));
+				return platformIcons.value(entry->displayPlatform(),
+				                          qApp->style()->standardIcon(QStyle::SP_FileIcon));
 			}
 			return entry->displayTitle(m_showFilename);
+
 		case COL_LOCATION:
 			return QDir::toNativeSeparators(entry->base);
-		case COL_PLATFORM:
-			return nicePlatformFormat(entry->platform);
+
+		case COL_PLATFORM: {
+			// Return the raw platform string for all roles so that
+			// QSortFilterProxyModel::setFilterFixedString() matches correctly
+			// regardless of whether filterRole() is DisplayRole or EditRole,
+			// and so that LibraryController::updateCountBadges() can use
+			// PlatformStrRole without a separate lookup.
+			QString platformStr = entry->displayPlatform();
+			return platformStr;
+		}
+
 		case COL_SIZE:
-			return (role == Qt::DisplayRole) ? QVariant(niceSizeFormat(entry->filesize)) : QVariant(int(entry->filesize));
+			return (role == Qt::DisplayRole)
+				? QVariant(niceSizeFormat(entry->filesize))
+				: QVariant(int(entry->filesize));
+
 		case COL_CRC32:
-			return (role == Qt::DisplayRole) ? QVariant(QStringLiteral("%0").arg(entry->crc32, 8, 16, QChar('0'))) : QVariant(entry->crc32);
+			return (role == Qt::DisplayRole)
+				? QVariant(QStringLiteral("%0").arg(entry->crc32, 8, 16, QChar('0')))
+				: QVariant(entry->crc32);
 		}
 	}
 

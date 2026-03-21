@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2022 Jeffrey Pfau
+/* Copyright (c) 2013-2024 Jeffrey Pfau
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -26,16 +26,21 @@ Q_OBJECT
 
 public:
 	enum Columns {
-		COL_NAME = 0,
+		COL_NAME     = 0,
 		COL_LOCATION = 1,
 		COL_PLATFORM = 2,
-		COL_SIZE = 3,
-		COL_CRC32 = 4,
-		MAX_COLUMN = 4,
+		COL_SIZE     = 3,
+		COL_CRC32    = 4,
+		MAX_COLUMN   = 4,
 	};
 
 	enum ItemDataRole {
-		FullPathRole = Qt::UserRole + 1,
+		FullPathRole    = Qt::UserRole + 1,
+		// New: raw platform string ("GBA", "GBC", "GB", "SGB") returned for
+		// both Qt::DisplayRole and Qt::EditRole on COL_PLATFORM so that
+		// QSortFilterProxyModel::setFilterFixedString() matches correctly
+		// regardless of which filterRole the proxy uses.
+		PlatformStrRole = Qt::UserRole + 2,
 	};
 
 	explicit LibraryModel(QObject* parent = nullptr);
