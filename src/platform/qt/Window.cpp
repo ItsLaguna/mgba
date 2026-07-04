@@ -726,6 +726,8 @@ void Window::keyReleaseEvent(QKeyEvent* event) {
 void Window::resizeEvent(QResizeEvent*) {
 	QSize newSize = centralWidget()->size();
 	if (!isFullScreen()) {
+		// Store in memory only — flushed to disk in closeEvent to avoid
+		// creating qt.ini.lock on every resize event.
 		m_config->setOption("height", newSize.height());
 		m_config->setOption("width", newSize.width());
 	}
