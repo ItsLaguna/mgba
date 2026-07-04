@@ -8,6 +8,7 @@
 
 #include "utils.h"
 
+#include <QFileInfo>
 #include <mgba/core/library.h>
 
 using namespace QGBA;

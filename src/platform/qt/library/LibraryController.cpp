@@ -21,6 +21,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QInputDialog>
 #include <QMenu>
 #include <QLineEdit>
 #include <QListView>
@@ -86,14 +87,23 @@ LibraryController::LibraryController(QWidget* parent, const QString& path, Confi
 		// Persist via emit so Window can save without triggering ConfigOption recursion
 		emit viewModeChanged(mode);
 	});
+	// Debounce timer for cover size config write
+	auto* coverSaveTimer = new QTimer(this);
+	coverSaveTimer->setSingleShot(true);
+	coverSaveTimer->setInterval(400);
+	connect(coverSaveTimer, &QTimer::timeout, this, [this]() {
+		if (m_config && m_gridDelegate)
+			m_config->setQtOption("libraryCoverSize", m_gridDelegate->coverSize());
+	});
+
 	connect(m_toolBar, &LibraryToolBar::coverSizeChanged,
-	        this, [this](int size) {
+	        this, [this, coverSaveTimer](int size) {
 		if (m_gridDelegate && m_gridView) {
 			m_gridDelegate->setCoverSize(size);
 			updateGridSize();
 			m_gridView->reset();
 		}
-		if (m_config) m_config->setQtOption("libraryCoverSize", size);
+		if (m_config) coverSaveTimer->start();
 	});
 
 	// ---- Cover manager ----------------------------------------------------
@@ -168,6 +178,47 @@ LibraryController::LibraryController(QWidget* parent, const QString& path, Confi
 
 		bool fav = m_favorites.contains(fullpath);
 		QMenu menu(view);
+
+		// --- Play ---
+		QAction* playAction = menu.addAction(tr("Play"));
+		QObject::connect(playAction, &QAction::triggered, this, [this, fullpath]() {
+			selectEntry(fullpath);
+			emit startGame();
+		});
+
+		menu.addSeparator();
+
+		// --- Rename ---
+		QAction* renameAction = menu.addAction(tr("Rename..."));
+		QObject::connect(renameAction, &QAction::triggered, this, [this, fullpath, view]() {
+			LibraryEntry e = m_libraryModel->entry(fullpath);
+			if (e.isNull()) return;
+			bool ok = false;
+			QString current = e.displayTitle(m_showFilename);
+			QString newName = QInputDialog::getText(
+				view,
+				tr("Rename Game"),
+				tr("New name:"),
+				QLineEdit::Normal,
+				current,
+				&ok
+			);
+			if (ok && !newName.isEmpty() && newName != current) {
+				// Store custom name in config
+				if (m_config) {
+					m_config->setQtOption(
+						fullpath,
+						newName,
+						QStringLiteral("libraryCustomName"));
+				}
+				// Update the model entry title in place
+				LibraryEntry updated = e;
+				updated.title = newName;
+				m_libraryModel->updateEntries({updated});
+			}
+		});
+
+		menu.addSeparator();
 
 		// --- Favorites ---
 		QAction* favAction = menu.addAction(fav ? tr("Remove from Favorites") : tr("Add to Favorites"));
@@ -493,6 +544,26 @@ void LibraryController::refresh() {
 	m_libraryModel->removeEntries(removedEntries.values());
 	m_libraryModel->updateEntries(updatedEntries);
 	m_libraryModel->addEntries(newEntries);
+
+	// Restore any custom names saved from previous rename operations
+	if (m_config) {
+		QList<LibraryEntry> renamedEntries;
+		int rows = m_libraryModel->rowCount();
+		for (int i = 0; i < rows; ++i) {
+			QString fp = m_libraryModel->index(i, 0).data(LibraryModel::FullPathRole).toString();
+			if (fp.isEmpty()) continue;
+			QVariant custom = m_config->getQtOption(fp, QStringLiteral("libraryCustomName"));
+			if (!custom.isNull() && !custom.toString().isEmpty()) {
+				LibraryEntry e = m_libraryModel->entry(fp);
+				if (!e.isNull()) {
+					e.title = custom.toString();
+					renamedEntries << e;
+				}
+			}
+		}
+		if (!renamedEntries.isEmpty())
+			m_libraryModel->updateEntries(renamedEntries);
+	}
 
 	for (size_t i = 0; i < mLibraryListingSize(&listing); ++i) {
 		mLibraryEntryFree(mLibraryListingGetPointer(&listing, i));
