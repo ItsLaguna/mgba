@@ -23,6 +23,9 @@
 #include <QFileInfo>
 #include <QInputDialog>
 #include <QMenu>
+#include <QMessageBox>
+
+#include <algorithm>
 #include <QLineEdit>
 #include <QListView>
 #include <QSortFilterProxyModel>
@@ -204,10 +207,11 @@ LibraryController::LibraryController(QWidget* parent, const QString& path, Confi
 				&ok
 			);
 			if (ok && !newName.isEmpty() && newName != current) {
-				// Store custom name in config
+				// Store custom name keyed by filename (not fullpath) so it
+				// survives the game being moved to a different directory.
 				if (m_config) {
 					m_config->setQtOption(
-						fullpath,
+						e.filename,
 						newName,
 						QStringLiteral("libraryCustomName"));
 				}
@@ -498,6 +502,13 @@ QPair<QString, QString> LibraryController::selectedPath() {
 void LibraryController::addDirectory(const QString& dir, bool recursive) {
 	std::shared_ptr<mLibrary> library = m_library;
 	m_libraryJob = GBAApp::app()->submitWorkerJob(std::bind(&LibraryController::loadDirectory, this, dir, recursive), this, [this, library]() {
+		// Clear any stale entries that now exist again after re-adding the folder
+		if (m_config) {
+			QList<QVariant> stale = m_config->getList("libraryStaleEntries");
+			stale.erase(std::remove_if(stale.begin(), stale.end(),
+				[](const QVariant& v) { return QFile::exists(v.toString()); }), stale.end());
+			m_config->setList("libraryStaleEntries", stale);
+		}
 		refresh();
 	});
 }
@@ -521,6 +532,14 @@ void LibraryController::refresh() {
 	QList<LibraryEntry> updatedEntries;
 	QList<LibraryEntry> newEntries;
 
+	// Load persisted stale paths — entries whose files no longer exist.
+	// We filter these out before adding to the model so they never appear.
+	QSet<QString> knownStale;
+	if (m_config) {
+		for (const QVariant& v : m_config->getList("libraryStaleEntries"))
+			knownStale.insert(v.toString());
+	}
+
 	mLibraryListing listing;
 	mLibraryListingInit(&listing, 0);
 	mLibraryGetEntries(m_library.get(), &listing, 0, 0, nullptr);
@@ -528,6 +547,14 @@ void LibraryController::refresh() {
 		const mLibraryEntry* entry = mLibraryListingGetConstPointer(&listing, i);
 		uint64_t checkHash = LibraryEntry::checkHash(entry);
 		QString fullpath = QStringLiteral("%1/%2").arg(entry->base, entry->filename);
+
+		// Skip entries whose files no longer exist on disk
+		if (!QFile::exists(fullpath)) {
+			removedEntries.remove(fullpath);
+			m_knownGames.remove(fullpath);
+			continue;
+		}
+
 		if (!m_knownGames.contains(fullpath)) {
 			newEntries.append(entry);
 		} else if (checkHash != m_knownGames[fullpath]) {
@@ -545,24 +572,87 @@ void LibraryController::refresh() {
 	m_libraryModel->updateEntries(updatedEntries);
 	m_libraryModel->addEntries(newEntries);
 
-	// Restore any custom names saved from previous rename operations
+	// Detect newly stale entries — files in newEntries that don't exist on disk.
+	// (Previously stale entries were already filtered out above.)
+	{
+		QList<QString> newlyStale;
+		for (const LibraryEntry& e : newEntries) {
+			if (!QFile::exists(e.fullpath))
+				newlyStale << e.fullpath;
+		}
+		// Also check updatedEntries
+		for (const LibraryEntry& e : updatedEntries) {
+			if (!QFile::exists(e.fullpath))
+				newlyStale << e.fullpath;
+		}
+
+		if (!newlyStale.isEmpty()) {
+			// Add to model removal and known stale set
+			m_libraryModel->removeEntries(newlyStale);
+			for (const QString& fp : newlyStale) {
+				m_knownGames.remove(fp);
+				knownStale.insert(fp);
+			}
+			// Persist using QSettings list — avoids ini corruption from path chars
+			if (m_config) {
+				QList<QVariant> staleList;
+				for (const QString& fp : knownStale)
+					staleList << fp;
+				m_config->setList("libraryStaleEntries", staleList);
+			}
+			// Notify user once
+			QTimer::singleShot(0, this, [this, count = newlyStale.size()]() {
+				QMessageBox::warning(window(),
+					tr("Library"),
+					tr("%n game(s) could not be found and have been removed from the library. "
+					   "If you moved your ROM folder, use \"Add Folder to Library\" to re-add it.",
+					   "", count));
+			});
+		}
+	}
+
+	// Restore any custom names saved from previous rename operations.
+	// Keyed by filename so names survive the ROM being moved to a different path.
 	if (m_config) {
 		QList<LibraryEntry> renamedEntries;
 		int rows = m_libraryModel->rowCount();
 		for (int i = 0; i < rows; ++i) {
 			QString fp = m_libraryModel->index(i, 0).data(LibraryModel::FullPathRole).toString();
 			if (fp.isEmpty()) continue;
-			QVariant custom = m_config->getQtOption(fp, QStringLiteral("libraryCustomName"));
+			LibraryEntry e = m_libraryModel->entry(fp);
+			if (e.isNull()) continue;
+			QVariant custom = m_config->getQtOption(e.filename, QStringLiteral("libraryCustomName"));
 			if (!custom.isNull() && !custom.toString().isEmpty()) {
-				LibraryEntry e = m_libraryModel->entry(fp);
-				if (!e.isNull()) {
-					e.title = custom.toString();
-					renamedEntries << e;
-				}
+				e.title = custom.toString();
+				renamedEntries << e;
 			}
 		}
 		if (!renamedEntries.isEmpty())
 			m_libraryModel->updateEntries(renamedEntries);
+	}
+
+	// One-time migration: re-key any old fullpath-based custom names to filename-based.
+	// Reads all keys from [libraryCustomName], and if a key looks like a fullpath
+	// (contains '/'), re-saves it under just the filename portion.
+	if (m_config) {
+		m_config->getQtOption("__migrated__", "libraryCustomName"); // touch group
+		// Use QSettings directly via getQtOption to enumerate keys
+		// We do this by reading all known game filenames and checking for fullpath keys
+		int rows = m_libraryModel->rowCount();
+		for (int i = 0; i < rows; ++i) {
+			QString fp = m_libraryModel->index(i, 0).data(LibraryModel::FullPathRole).toString();
+			if (fp.isEmpty()) continue;
+			// Check if there's a fullpath-keyed entry
+			QVariant oldVal = m_config->getQtOption(fp, QStringLiteral("libraryCustomName"));
+			if (!oldVal.isNull() && !oldVal.toString().isEmpty()) {
+				QString filename = fp.section('/', -1);
+				// Re-save under filename key and remove the fullpath key
+				m_config->setQtOption(filename, oldVal, QStringLiteral("libraryCustomName"));
+				// Remove old key by setting empty — QSettings doesn't have remove via ConfigController
+				// so we overwrite with empty and skip it in restore
+				m_config->setQtOption(fp, QString(), QStringLiteral("libraryCustomName"));
+			}
+		}
 	}
 
 	for (size_t i = 0; i < mLibraryListingSize(&listing); ++i) {
